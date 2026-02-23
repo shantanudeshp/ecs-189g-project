@@ -5,7 +5,15 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from sklearn.metrics import f1_score  
 import torch.optim as optim
-import wandb
+try:
+    import wandb
+except Exception:  # pragma: no cover - fallback when wandb isn't available
+    class _DummyWandb:
+        def init(self, *args, **kwargs):
+            return None
+        def log(self, *args, **kwargs):
+            return None
+    wandb = _DummyWandb()
 import argparse
 import os
 
@@ -17,88 +25,31 @@ torch.manual_seed(seed)
 np.random.seed(seed)
 random.seed(seed)
 
-if(torch.cuda.is_available()):
-    gpu=0
-    device='cuda:{}'.format(gpu)
-else:
-  device='cpu' 
+def resolve_device(requested: str = "auto") -> str:
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return "cuda:0"
+        if torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+    return requested
 
 
 # MODES = [0, -1, 1]
 MODEL_LAYER_EMB_MAP = {
-    "llama2_7b": {
-        "num_layers": 32,
-        "emb_size": 4096
+    "distilgpt2": {
+    "num_layers": 6,
+    "emb_size": 768
     },
-    "llama2_7b_chat": {
-        "num_layers": 32,
-        "emb_size": 4096
-    },
-    "llama2_13b": {
-        "num_layers": 40,
-        "emb_size": 5120
-    },
-    "llama2_13b_chat": {
-        "num_layers": 40,
-        "emb_size": 5120
-    },
-    "mistral_7b": {
-        "num_layers": 32,
-        "emb_size": 4096
-    },
-    "mistral_7b_instruct": {
-        "num_layers": 32,
-        "emb_size": 4096
-    },
-    "llama3_8b": {
-        "num_layers": 32,
-        "emb_size": 4096
-    },
-    "llama3_8b_instruct": {
-        "num_layers": 32,
-        "emb_size": 4096
-    },
-    "llama3_70b": {
-        "num_layers": 80,
-        "emb_size": 8192
-    },
-    "llama3_70b_instruct": {
-        "num_layers": 80,
-        "emb_size": 8192
-    },
-    "gemma_7b": {
-        "num_layers": 28,
-        "emb_size": 3072
-    },
-    "gemma_7b_it": {
-        "num_layers": 28,
-        "emb_size": 3072
-    },
-    "llama3.1_8b": {
-        "num_layers": 32,
-        "emb_size": 4096
-    },
-    "llama3.1_8b_instruct": {
-        "num_layers": 32,
-        "emb_size": 4096
+    "gpt2": {
+        "num_layers": 12,
+        "emb_size": 768
     }
 }
 
 MODELS_IDS = {
-  "llama2_7b": "meta-llama/Llama-2-7b-hf",
-  "llama2_13b": "meta-llama/Llama-2-13b-hf",
-  "mistral_7b": "mistralai/Mistral-7B-v0.3",
-  "llama3_8b": "meta-llama/Meta-Llama-3-8B",
-  "llama3_70b": "meta-llama/Meta-Llama-3-70B",
-  "gemma_7b": "google/gemma-7b",
-  "llama3.1_8b": "meta-llama/Meta-Llama-3.1-8B",
-  "llama2_7b_chat":"meta-llama/Llama-2-7b-chat-hf",
-  "llama2_13b_chat": "meta-llama/Llama-2-13b-chat-hf",
-  "mistral_7b_instruct":"mistralai/Mistral-7B-Instruct-v0.3",
-  "llama3_8b_instruct":"meta-llama/Meta-Llama-3-8B-Instruct",
-  "llama3_70b_instruct": "meta-llama/Meta-Llama-3-70B-Instruct",
-  "gemma_7b_it": "google/gemma-7b-it",
-  "llama3.1_8b_instruct": "meta-llama/Llama-3.1-8B-Instruct"
+    "distilgpt2": "distilgpt2",
+    "gpt2": "gpt2"
 }
 
 def map_selected_mode(hs, mode):
@@ -204,7 +155,7 @@ def false_negatives(outputs, labels):
     return false_negatives.item()
 
 
-def train_model(model, train_loader, val_loader, epochs, criterion, optimizer, best_model_path):
+def train_model(model, train_loader, val_loader, epochs, criterion, optimizer, best_model_path, use_wandb=True):
     
     best_val_accuracy = 0.0
     best_val_loss = 1000
@@ -268,10 +219,10 @@ def train_model(model, train_loader, val_loader, epochs, criterion, optimizer, b
         val_acc /= len(val_loader)
         val_f1 /= len(val_loader)
 
-        val_precision/= len(train_loader)
-        val_recall/= len(train_loader)
-        val_false_positives/= len(train_loader)
-        val_false_negatives/= len(train_loader)
+        val_precision/= len(val_loader)
+        val_recall/= len(val_loader)
+        val_false_positives/= len(val_loader)
+        val_false_negatives/= len(val_loader)
 
         # print(f'Val Loss: {val_loss:.4f}, Val Accuracy: {val_acc:.4f}, Val F1: {val_f1}')
         print(f'Val Loss: {val_loss:.4f}, Val Accuracy: {val_acc:.4f}, Val F1: {val_f1:.4f}, '
@@ -279,23 +230,24 @@ def train_model(model, train_loader, val_loader, epochs, criterion, optimizer, b
             f'Val False Positives: {val_false_positives:.4f}, Val False Negatives: {val_false_negatives:.4f}')
 
 
-        wandb.log({
-            'epoch': epoch,
-            'train_loss': train_loss,
-            'train_accuracy': train_acc,
-            'train_f1': train_f1,
-            'train_precision': train_precision,
-            'train_recall': train_recall,
-            'train_false_positives': train_false_positives,
-            'train_false_negatives': train_false_negatives,
-            'val_loss': val_loss,
-            'val_accuracy': val_acc,
-            'val_f1': val_f1,
-            'val_precision': val_precision,
-            'val_recall': val_recall,
-            'val_false_positives': val_false_positives,
-            'val_false_negatives': val_false_negatives
-        })
+        if use_wandb:
+            wandb.log({
+                'epoch': epoch,
+                'train_loss': train_loss,
+                'train_accuracy': train_acc,
+                'train_f1': train_f1,
+                'train_precision': train_precision,
+                'train_recall': train_recall,
+                'train_false_positives': train_false_positives,
+                'train_false_negatives': train_false_negatives,
+                'val_loss': val_loss,
+                'val_accuracy': val_acc,
+                'val_f1': val_f1,
+                'val_precision': val_precision,
+                'val_recall': val_recall,
+                'val_false_positives': val_false_positives,
+                'val_false_negatives': val_false_negatives
+            })
 
         # if val_loss < best_val_loss:
         if val_acc > best_val_accuracy:
@@ -307,7 +259,7 @@ def train_model(model, train_loader, val_loader, epochs, criterion, optimizer, b
     return
 
 
-def test_model(model, test_loader, criterion):
+def test_model(model, test_loader, criterion, use_wandb=True):
     model.to(device)
     model.eval()
     test_loss, test_acc, test_f1, test_precision, test_recall, test_false_positives, test_false_negatives = 0, 0, 0, 0, 0, 0, 0
@@ -345,7 +297,8 @@ def test_model(model, test_loader, criterion):
     'test_false_positives': test_false_positives,
     'test_false_negatives': test_false_negatives
 }
-    wandb.log(test_metrics)
+    if use_wandb:
+        wandb.log(test_metrics)
 
     # print(f'Test Loss: {test_loss:.4f}, Test Accuracy: {test_acc:.4f}, Test F1: {test_f1}')
     print(f'Test Loss: {test_loss:.4f}, Test Accuracy: {test_acc:.4f}, Test F1: {test_f1:.4f}, '
@@ -353,28 +306,61 @@ def test_model(model, test_loader, criterion):
       f'Test False Positives: {test_false_positives:.4f}, Test False Negatives: {test_false_negatives:.4f}')
 
 
-parser = argparse.ArgumentParser(description="model_id and dataset name.")
+parser = argparse.ArgumentParser(description="Train classifier on hidden states.")
 parser.add_argument("model_id", type=str, help="Enter the model ID")
 parser.add_argument("dataset_name", type=str, help="Enter the dataset name")
 parser.add_argument("modes", nargs='*', type=int, default=[0],
                         help="Pass the modes, e.g., 0, 1, or -1. Accepts multiple modes separated by space.")
+parser.add_argument("--data-root", type=str, default="datasets", help="Root directory for datasets")
+parser.add_argument("--hs-dir", type=str, default="hs", help="Hidden-state directory name under dataset/model")
+parser.add_argument("--layers", type=str, default="all", help="Comma-separated layer list or 'all'")
+parser.add_argument("--batch-size", type=int, default=128, help="Batch size")
+parser.add_argument("--epochs", type=int, default=50, help="Training epochs")
+parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+parser.add_argument("--hidden-size", type=int, default=1024, help="MLP hidden size")
+parser.add_argument("--num-layers", type=int, default=None, help="Override number of layers")
+parser.add_argument("--emb-size", type=int, default=None, help="Override embedding size")
+parser.add_argument("--save-dir", type=str, default="clss", help="Output directory for classifier checkpoints")
+parser.add_argument("--wandb-project", type=str, default=None, help="W&B project name")
+parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity name")
+parser.add_argument("--wandb-run-prefix", type=str, default="", help="Prefix for W&B run name")
+parser.add_argument("--no-wandb", action="store_true", help="Disable W&B logging")
+parser.add_argument("--device", type=str, default="auto", help="Device: auto, cpu, cuda, or mps")
 # [0, -1, 1] 
 
 #modes [0, -1, 1]
 # Parse arguments
 args = parser.parse_args()
+device = resolve_device(args.device)
 model_id = args.model_id
 dataset_name = args.dataset_name
 modes = args.modes
 
-emb_size = MODEL_LAYER_EMB_MAP[model_id]["emb_size"]
-num_layers = MODEL_LAYER_EMB_MAP[model_id]["num_layers"]
-model_id = MODELS_IDS[args.model_id].split("/")[-1] # update the model id to be part of the path
+if model_id in MODEL_LAYER_EMB_MAP:
+    emb_size = MODEL_LAYER_EMB_MAP[model_id]["emb_size"]
+    num_layers = MODEL_LAYER_EMB_MAP[model_id]["num_layers"]
+else:
+    if args.emb_size is None or args.num_layers is None:
+        raise ValueError("Unknown model_id. Provide --emb-size and --num-layers.")
+    emb_size = args.emb_size
+    num_layers = args.num_layers
 
-layers = list(range(num_layers+1))
+model_id_path = MODELS_IDS.get(args.model_id, args.model_id)
+model_id = model_id_path.split("/")[-1] # update the model id to be part of the path
+
+if args.layers.strip().lower() == "all":
+    layers = list(range(num_layers + 1))
+else:
+    layers = [int(x) for x in args.layers.split(",") if x.strip()]
 
 # Check if the directory exists, and create it if it doesn't
-os.makedirs(f"clss/{dataset_name}/{model_id}", exist_ok=True)
+os.makedirs(f"{args.save_dir}/{dataset_name}/{model_id}", exist_ok=True)
+
+def _load_split(data_root, dataset_name, model_id, hs_dir, split, layer):
+    path = os.path.join(data_root, dataset_name, model_id, hs_dir, split, f"layer_{layer}.pth")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing split file: {path}")
+    return torch.load(path, map_location=torch.device('cpu'))
 
 for mode in modes:
     for layer in layers:
@@ -383,17 +369,9 @@ for mode in modes:
         # val_path = f"datasets/{dataset_name}/{model_id}/hs/val/layer_{layer}.pth"
         # test_path = f"datasets/{dataset_name}/{model_id}/hs/test/layer_{layer}.pth"
         
-        train_path = f"/projects/bbwz/deema/additional_LMs/{model_id}/hs/train/layer_{layer}.pth"
-        val_path = f"/projects/bbwz/deema/additional_LMs/{model_id}/hs/val/layer_{layer}.pth"
-        test_path = f"/projects/bbwz/deema/additional_LMs/{model_id}/hs/test/layer_{layer}.pth"
-        
-        # train_path = f"/projects/bbwz/deema/additional_LMs/train_factual_aggregated/layer_{layer}.pth"
-        # val_path = f"/projects/bbwz/deema/additional_LMs/val_factual_aggregated/layer_{layer}.pth"
-        # test_path = f"/projects/bbwz/deema/additional_LMs/test_factual_aggregated/layer_{layer}.pth"
-
-        train_data = torch.load(train_path, map_location=torch.device('cpu'))
-        val_data = torch.load(val_path, map_location=torch.device('cpu'))
-        test_data = torch.load(test_path, map_location=torch.device('cpu'))
+        train_data = _load_split(args.data_root, dataset_name, model_id, args.hs_dir, "train", layer)
+        val_data = _load_split(args.data_root, dataset_name, model_id, args.hs_dir, "val", layer)
+        test_data = _load_split(args.data_root, dataset_name, model_id, args.hs_dir, "test", layer)
 
         train_data = [(map_selected_mode(tensors, mode), label) for tensors, label in zip(train_data['hs'], train_data['labels'])]
         val_data = [(map_selected_mode(tensors, mode), label) for tensors, label in zip(val_data['hs'], val_data['labels'])]
@@ -408,19 +386,21 @@ for mode in modes:
         val_dataset = CustomDataset([t[0] for t in val_data], [t[1] for t in val_data])
         test_dataset = CustomDataset([t[0] for t in test_data], [t[1] for t in test_data])
 
-        train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, collate_fn=collate_fn)
-        val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False, collate_fn=collate_fn)
-        test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False, collate_fn=collate_fn)
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
 
-        run_name = f"m_{mode}_l_{layer}_b_128"
-        wandb.init(project=f"cls_{dataset_name}_{model_id}_3_shots", entity="deema2", name=run_name, reinit=True)
+        run_name = f"{args.wandb_run_prefix}m_{mode}_l_{layer}_b_{args.batch_size}"
+        use_wandb = not args.no_wandb and args.wandb_project is not None
+        if use_wandb:
+            wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=run_name, reinit=True)
 
-        best_model_path = f"clss/{dataset_name}/{model_id}/{run_name}.pth"
+        best_model_path = f"{args.save_dir}/{dataset_name}/{model_id}/{run_name}.pth"
 
-        model = SimpleMLP(emb_size, 1024, 1)
+        model = SimpleMLP(emb_size, args.hidden_size, 1)
 
         criterion = nn.BCELoss()
-        optimizer = optim.Adam(model.parameters(), lr=0.0001)
-        train_model(model, train_loader, val_loader, epochs=50, criterion=criterion, optimizer=optimizer, best_model_path = best_model_path)
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+        train_model(model, train_loader, val_loader, epochs=args.epochs, criterion=criterion, optimizer=optimizer, best_model_path=best_model_path, use_wandb=use_wandb)
         model.load_state_dict(torch.load(best_model_path))
-        test_model(model, test_loader, criterion)
+        test_model(model, test_loader, criterion, use_wandb=use_wandb)
