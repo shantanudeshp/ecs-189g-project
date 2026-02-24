@@ -16,6 +16,7 @@ except Exception:  # pragma: no cover - fallback when wandb isn't available
     wandb = _DummyWandb()
 import argparse
 import os
+import json
 
 # Set a seed value
 seed = 42  # You can choose any seed number
@@ -155,12 +156,13 @@ def false_negatives(outputs, labels):
     return false_negatives.item()
 
 
-def train_model(model, train_loader, val_loader, epochs, criterion, optimizer, best_model_path, use_wandb=True):
+def train_model(model, train_loader, val_loader, epochs, criterion, optimizer, best_model_path, use_wandb=True, log_json_path=None):
     
     best_val_accuracy = 0.0
     best_val_loss = 1000
     model.to(device)
 
+    metrics = []
     for epoch in range(epochs):
         # Training phase
         model.train()
@@ -230,23 +232,28 @@ def train_model(model, train_loader, val_loader, epochs, criterion, optimizer, b
             f'Val False Positives: {val_false_positives:.4f}, Val False Negatives: {val_false_negatives:.4f}')
 
 
+        epoch_metrics = {
+            'epoch': epoch,
+            'train_loss': float(train_loss),
+            'train_accuracy': float(train_acc),
+            'train_f1': float(train_f1),
+            'train_precision': float(train_precision),
+            'train_recall': float(train_recall),
+            'train_false_positives': float(train_false_positives),
+            'train_false_negatives': float(train_false_negatives),
+            'val_loss': float(val_loss),
+            'val_accuracy': float(val_acc),
+            'val_f1': float(val_f1),
+            'val_precision': float(val_precision),
+            'val_recall': float(val_recall),
+            'val_false_positives': float(val_false_positives),
+            'val_false_negatives': float(val_false_negatives)
+        }
+        metrics.append(epoch_metrics)
+
         if use_wandb:
             wandb.log({
-                'epoch': epoch,
-                'train_loss': train_loss,
-                'train_accuracy': train_acc,
-                'train_f1': train_f1,
-                'train_precision': train_precision,
-                'train_recall': train_recall,
-                'train_false_positives': train_false_positives,
-                'train_false_negatives': train_false_negatives,
-                'val_loss': val_loss,
-                'val_accuracy': val_acc,
-                'val_f1': val_f1,
-                'val_precision': val_precision,
-                'val_recall': val_recall,
-                'val_false_positives': val_false_positives,
-                'val_false_negatives': val_false_negatives
+                **epoch_metrics
             })
 
         # if val_loss < best_val_loss:
@@ -256,7 +263,11 @@ def train_model(model, train_loader, val_loader, epochs, criterion, optimizer, b
             torch.save(model.state_dict(), best_model_path)
             print(f"** New best model saved at Epoch {epoch} with Val Accuracy: {val_acc} and Val Loss: {val_loss} **")
 
-    return
+    if log_json_path:
+        os.makedirs(os.path.dirname(log_json_path), exist_ok=True)
+        with open(log_json_path, "w") as f:
+            json.dump({"epochs": metrics}, f, indent=2)
+    return metrics
 
 
 def test_model(model, test_loader, criterion, use_wandb=True):
@@ -289,14 +300,14 @@ def test_model(model, test_loader, criterion, use_wandb=True):
     test_false_negatives /= len(test_loader)
 
     test_metrics = {
-    'test_loss': test_loss,
-    'test_acc': test_acc,
-    'test_f1': test_f1,
-    'test_precision': test_precision,
-    'test_recall': test_recall,
-    'test_false_positives': test_false_positives,
-    'test_false_negatives': test_false_negatives
-}
+        'test_loss': float(test_loss),
+        'test_acc': float(test_acc),
+        'test_f1': float(test_f1),
+        'test_precision': float(test_precision),
+        'test_recall': float(test_recall),
+        'test_false_positives': float(test_false_positives),
+        'test_false_negatives': float(test_false_negatives)
+    }
     if use_wandb:
         wandb.log(test_metrics)
 
@@ -304,6 +315,7 @@ def test_model(model, test_loader, criterion, use_wandb=True):
     print(f'Test Loss: {test_loss:.4f}, Test Accuracy: {test_acc:.4f}, Test F1: {test_f1:.4f}, '
       f'Test Precision: {test_precision:.4f}, Test Recall: {test_recall:.4f}, '
       f'Test False Positives: {test_false_positives:.4f}, Test False Negatives: {test_false_negatives:.4f}')
+    return test_metrics
 
 
 parser = argparse.ArgumentParser(description="Train classifier on hidden states.")
@@ -326,6 +338,7 @@ parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity n
 parser.add_argument("--wandb-run-prefix", type=str, default="", help="Prefix for W&B run name")
 parser.add_argument("--no-wandb", action="store_true", help="Disable W&B logging")
 parser.add_argument("--device", type=str, default="auto", help="Device: auto, cpu, cuda, or mps")
+parser.add_argument("--log-json", type=str, default=None, help="Write metrics to JSON at this path")
 # [0, -1, 1] 
 
 #modes [0, -1, 1]
@@ -360,7 +373,7 @@ def _load_split(data_root, dataset_name, model_id, hs_dir, split, layer):
     path = os.path.join(data_root, dataset_name, model_id, hs_dir, split, f"layer_{layer}.pth")
     if not os.path.exists(path):
         raise FileNotFoundError(f"Missing split file: {path}")
-    return torch.load(path, map_location=torch.device('cpu'))
+    return torch.load(path, map_location=torch.device('cpu'), weights_only=False)
 
 for mode in modes:
     for layer in layers:
@@ -401,6 +414,16 @@ for mode in modes:
 
         criterion = nn.BCELoss()
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
-        train_model(model, train_loader, val_loader, epochs=args.epochs, criterion=criterion, optimizer=optimizer, best_model_path=best_model_path, use_wandb=use_wandb)
-        model.load_state_dict(torch.load(best_model_path))
-        test_model(model, test_loader, criterion, use_wandb=use_wandb)
+        log_json_path = args.log_json
+        if log_json_path:
+            log_json_path = log_json_path.replace("{dataset}", dataset_name).replace("{model}", model_id).replace("{layer}", str(layer)).replace("{mode}", str(mode))
+        train_model(model, train_loader, val_loader, epochs=args.epochs, criterion=criterion, optimizer=optimizer, best_model_path=best_model_path, use_wandb=use_wandb, log_json_path=log_json_path)
+        model.load_state_dict(torch.load(best_model_path, weights_only=True))
+        test_metrics = test_model(model, test_loader, criterion, use_wandb=use_wandb)
+        if log_json_path:
+            with open(log_json_path, "r+") as f:
+                payload = json.load(f)
+                payload["test"] = test_metrics
+                f.seek(0)
+                json.dump(payload, f, indent=2)
+                f.truncate()
