@@ -1,0 +1,10 @@
+# NOTE: Install PyTorch separately for your CUDA version, e.g.:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+datasets
+jsonlines
+numpy
+requests
+scikit-learn
+tqdm
+transformers
+wandb
