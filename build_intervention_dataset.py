@@ -46,6 +46,10 @@ def gsm8k_match(pred: str, gold: str) -> bool:
     return pred_num == gold_num
 
 
+def ai2_arc_strict_match(pred: str, gold: str) -> bool:
+    return pred.strip().upper() == gold.strip().upper()
+
+
 def load_nq(split: str, limit: int) -> List[Tuple[str, str]]:
     ds = load_dataset("nq_open", split=split)
     data = []
@@ -81,11 +85,78 @@ def load_gsm8k(split: str, limit: int) -> List[Tuple[str, str]]:
     return data[:limit]
 
 
+def load_ai2_arc(split: str, limit: int) -> List[Tuple[str, str]]:
+    ds = load_dataset("ai2_arc", "ARC-Challenge", split=split)
+    data = []
+    for ex in ds:
+        q = ex["question"]
+        choices = ex["choices"]
+        labels = choices.get("label", [])
+        texts = choices.get("text", [])
+        if len(labels) < 4 or len(texts) < 4:
+            continue
+        label_to_text = {l: t for l, t in zip(labels, texts)}
+        options = [label_to_text.get(l, "") for l in ["A", "B", "C", "D"]]
+        if any(o == "" for o in options):
+            continue
+        prompt = (
+            f"Question: {q}\n"
+            f"A) {options[0]}\n"
+            f"B) {options[1]}\n"
+            f"C) {options[2]}\n"
+            f"D) {options[3]}\n"
+            "Answer with a single letter (A, B, C, or D):"
+        )
+        gold = str(ex.get("answerKey", "")).strip().upper()
+        if gold not in ["A", "B", "C", "D"]:
+            continue
+        data.append((prompt, gold))
+        if len(data) >= limit:
+            break
+    return data
+
+
 def generate_answer(model, tokenizer, prompt: str, device: str, max_new_tokens: int) -> str:
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     out = model.generate(**inputs, max_new_tokens=max_new_tokens)
     text = tokenizer.decode(out[0], skip_special_tokens=True)
     return text.split("Answer:")[-1].strip()
+
+
+def extract_first_letter(pred: str) -> str:
+    for ch in pred.strip().upper():
+        if ch in ["A", "B", "C", "D"]:
+            return ch
+    return ""
+
+
+@torch.no_grad()
+def predict_letter_from_logits(model, tokenizer, prompt: str, device: str) -> str:
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    out = model(**inputs)
+    logits = out.logits[0, -1]
+
+    candidates = {
+        "A": [" A", "A"],
+        "B": [" B", "B"],
+        "C": [" C", "C"],
+        "D": [" D", "D"],
+    }
+    best_letter = ""
+    best_logit = None
+    for letter, toks in candidates.items():
+        ids = []
+        for t in toks:
+            tid = tokenizer.encode(t, add_special_tokens=False)
+            if len(tid) == 1:
+                ids.append(tid[0])
+        if not ids:
+            continue
+        letter_logit = max(float(logits[i]) for i in ids)
+        if best_logit is None or letter_logit > best_logit:
+            best_logit = letter_logit
+            best_letter = letter
+    return best_letter
 
 
 @torch.no_grad()
@@ -106,7 +177,7 @@ def get_hidden_states(model, tokenizer, text: str, device: str):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True, help="HF model id (e.g., distilgpt2, gpt2)")
-    p.add_argument("--dataset", required=True, choices=["nq_open", "medmcqa", "gsm8k"])
+    p.add_argument("--dataset", required=True, choices=["nq_open", "medmcqa", "gsm8k", "ai2_arc"])
     p.add_argument("--n-train", type=int, default=2000)
     p.add_argument("--n-val", type=int, default=400)
     p.add_argument("--n-test", type=int, default=400)
@@ -136,7 +207,7 @@ def main():
     else:
         model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16, device_map="auto")
 
-    loaders = {"nq_open": load_nq, "medmcqa": load_medmcqa, "gsm8k": load_gsm8k}
+    loaders = {"nq_open": load_nq, "medmcqa": load_medmcqa, "gsm8k": load_gsm8k, "ai2_arc": load_ai2_arc}
     load_fn = loaders[args.dataset]
 
     train = load_fn("train", args.n_train)
@@ -190,9 +261,14 @@ def main():
         for idx, (prompt, gold) in enumerate(tqdm(split_data, desc=f"{split_name}_fct")):
             full_prompt = build_kshot_prompt(prompt, idx, is_train)
 
-            pred = generate_answer(model, tokenizer, full_prompt, args.device, args.max_new_tokens)
+            if args.dataset == "ai2_arc":
+                pred = predict_letter_from_logits(model, tokenizer, full_prompt, args.device)
+            else:
+                pred = generate_answer(model, tokenizer, full_prompt, args.device, args.max_new_tokens)
             if args.dataset == "gsm8k":
                 correct = gsm8k_match(pred, gold)
+            elif args.dataset == "ai2_arc":
+                correct = ai2_arc_strict_match(pred, gold)
             else:
                 correct = exact_match(pred, gold)
 

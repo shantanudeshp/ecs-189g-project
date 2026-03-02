@@ -99,7 +99,7 @@ def load_fct_layer(data_root: str, dataset: str, model_name: str, split: str, la
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="distilgpt2", help="HF model id used to build datasets")
-    p.add_argument("--dataset", required=True, choices=["nq_open", "medmcqa", "gsm8k"])
+    p.add_argument("--dataset", required=True, choices=["nq_open", "medmcqa", "gsm8k", "ai2_arc"])
     p.add_argument("--layer", type=int, required=True, help="layer index used in train_fct/layer_<L>.pth")
     p.add_argument("--data-root", default="datasets")
 

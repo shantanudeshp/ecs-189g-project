@@ -102,6 +102,43 @@ def load_medmcqa(split: str, n: int) -> List[Tuple[str, str]]:
     return out
 
 
+def load_ai2_arc(split: str, n: int) -> List[Tuple[str, str]]:
+    """
+    ARC-Challenge multiple-choice QA (A/B/C/D).
+    HF dataset: ai2_arc, subset ARC-Challenge.
+    """
+    ds = load_dataset("ai2_arc", "ARC-Challenge", split=split)
+    out = []
+    for ex in ds:
+        q = ex["question"]
+        choices = ex["choices"]
+        labels = choices.get("label", [])
+        texts = choices.get("text", [])
+        # Build A-D options; skip if not 4-way.
+        if len(labels) < 4 or len(texts) < 4:
+            continue
+        # Ensure labels are A-D order; if not, align via dict.
+        label_to_text = {l: t for l, t in zip(labels, texts)}
+        options = [label_to_text.get(l, "") for l in ["A", "B", "C", "D"]]
+        if any(o == "" for o in options):
+            continue
+
+        prompt = (
+            f"Question: {q}\n"
+            f"A) {options[0]}\n"
+            f"B) {options[1]}\n"
+            f"C) {options[2]}\n"
+            f"D) {options[3]}\n"
+            f"Answer with a single letter (A, B, C, or D):"
+        )
+        gold = str(ex.get("answerKey", "")).strip().upper()
+        if gold not in ["A", "B", "C", "D"]:
+            continue
+        out.append((prompt, gold))
+        if len(out) >= n:
+            break
+    return out
+
 # -------------------------
 # Normalization + matching
 # -------------------------
@@ -222,6 +259,47 @@ def generate_answer(model, tokenizer, prompt: str, device: str, max_new_tokens: 
     return tokenizer.decode(gen, skip_special_tokens=True).strip()
 
 
+def extract_first_letter(pred: str) -> str:
+    for ch in pred.strip().upper():
+        if ch in ["A", "B", "C", "D"]:
+            return ch
+    return ""
+
+
+@torch.no_grad()
+def predict_letter_from_logits(model, tokenizer, prompt: str, device: str) -> str:
+    """
+    For multiple-choice: force a single-letter prediction by scoring next-token logits
+    for A/B/C/D (with and without leading space) and taking argmax.
+    """
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    out = model(**inputs)
+    logits = out.logits[0, -1]  # next-token logits
+
+    candidates = {
+        "A": [" A", "A"],
+        "B": [" B", "B"],
+        "C": [" C", "C"],
+        "D": [" D", "D"],
+    }
+    best_letter = ""
+    best_logit = None
+    for letter, toks in candidates.items():
+        ids = []
+        for t in toks:
+            tid = tokenizer.encode(t, add_special_tokens=False)
+            if len(tid) == 1:
+                ids.append(tid[0])
+        if not ids:
+            continue
+        # max logit among variants
+        letter_logit = max(float(logits[i]) for i in ids)
+        if best_logit is None or letter_logit > best_logit:
+            best_logit = letter_logit
+            best_letter = letter
+    return best_letter
+
+
 @torch.no_grad()
 def get_hidden_states_over_input(model, tokenizer, prompt: str, device: str) -> List[List[torch.Tensor]]:
     """
@@ -273,6 +351,12 @@ def compute_labels(dataset: str, prompt: str, pred: str, gold: str) -> Tuple[int
         relaxed = 1 if medmcqa_relaxed_match(pred, gold, prompt) else 0
         return strict, relaxed
 
+    if dataset == "ai2_arc":
+        # strict: exact letter match only
+        strict = 1 if pred.strip().upper() == gold.strip().upper() else 0
+        relaxed = 1 if medmcqa_relaxed_match(pred, gold, prompt) else 0
+        return strict, relaxed
+
     # nq_open default
     strict = 1 if exact_match(pred, gold) else 0
     relaxed = 1 if relaxed_match(pred, gold) else 0
@@ -282,7 +366,7 @@ def compute_labels(dataset: str, prompt: str, pred: str, gold: str) -> Tuple[int
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
-    parser.add_argument("--dataset", required=True, choices=["nq_open", "medmcqa", "gsm8k"])
+    parser.add_argument("--dataset", required=True, choices=["nq_open", "medmcqa", "gsm8k", "ai2_arc"])
     parser.add_argument("--data-root", type=str, default="datasets")
 
     parser.add_argument("--n-train", type=int, default=2000)
@@ -325,6 +409,7 @@ def main():
         "nq_open": load_nq,
         "medmcqa": load_medmcqa,
         "gsm8k": load_gsm8k,
+        "ai2_arc": load_ai2_arc,
     }
     load_fn = loaders[args.dataset]
 
@@ -395,7 +480,10 @@ def main():
             iterator = enumerate(raw_split[:n_target])
             for idx, (prompt, gold) in tqdm(list(iterator), desc=split_name):
                 full_prompt = build_kshot_prompt(prompt, idx, train_raw, is_train)
-                pred = generate_answer(model, tokenizer, full_prompt, args.device, args.max_new_tokens)
+                if args.dataset == "ai2_arc":
+                    pred = predict_letter_from_logits(model, tokenizer, full_prompt, args.device)
+                else:
+                    pred = generate_answer(model, tokenizer, full_prompt, args.device, args.max_new_tokens)
                 ls, lr = compute_labels(args.dataset, full_prompt, pred, gold)
                 hs = get_hidden_states_over_input(model, tokenizer, full_prompt, args.device)
 
@@ -421,7 +509,10 @@ def main():
                 break
 
             full_prompt = build_kshot_prompt(prompt, idx, train_raw, is_train)
-            pred = generate_answer(model, tokenizer, full_prompt, args.device, args.max_new_tokens)
+            if args.dataset == "ai2_arc":
+                pred = predict_letter_from_logits(model, tokenizer, full_prompt, args.device)
+            else:
+                pred = generate_answer(model, tokenizer, full_prompt, args.device, args.max_new_tokens)
             ls, lr = compute_labels(args.dataset, full_prompt, pred, gold)
 
             # IMPORTANT: balancing uses STRICT labels (paper-aligned)

@@ -12,7 +12,7 @@ Outputs:
 - intervened generation
 - classifier prob on prompt
 
-Works best with: distilgpt2, gpt2
+Works best with: distilgpt2, gpt2, phi-2, qwen
 """
 
 import argparse
@@ -29,6 +29,29 @@ def resolve_device(requested: str) -> str:
             return "mps"
         return "cpu"
     return requested
+
+
+def get_hidden_size(model) -> int:
+    cfg = model.config
+    for attr in ("n_embd", "hidden_size", "n_hidden"):
+        if hasattr(cfg, attr):
+            return int(getattr(cfg, attr))
+    raise AttributeError("Could not infer hidden size from model config.")
+
+
+def get_block_list(model):
+    """
+    Return the list-like module of transformer blocks across common architectures.
+    """
+    if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+        return model.transformer.h  # GPT-2 style
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        return model.model.layers   # LLaMA/Phi/Qwen style
+    if hasattr(model, "gpt_neox") and hasattr(model.gpt_neox, "layers"):
+        return model.gpt_neox.layers  # GPT-NeoX style
+    if hasattr(model, "transformer") and hasattr(model.transformer, "layers"):
+        return model.transformer.layers
+    raise AttributeError("Unsupported model architecture: cannot locate transformer blocks.")
 
 
 def pool_hidden(hs_tokens, mode: int) -> torch.Tensor:
@@ -121,7 +144,7 @@ def main():
     model.eval()
 
     # Determine hidden size
-    d = model.config.n_embd
+    d = get_hidden_size(model)
 
     # Load classifier
     cls = SimpleMLP(input_size=d, hidden_size=1024).to(device)
@@ -181,8 +204,14 @@ def main():
         applied["flag"] = True
         return hidden
 
-    # Register hook (GPT-2 style: model.transformer.h is blocks)
-    handle = model.transformer.h[args.layer - 1].register_forward_hook(hook_fn) if args.layer > 0 else None
+    # Register hook on the specified block
+    blocks = get_block_list(model)
+    if args.layer > 0:
+        if args.layer - 1 >= len(blocks):
+            raise ValueError(f"layer={args.layer} out of range for model blocks (len={len(blocks)})")
+        handle = blocks[args.layer - 1].register_forward_hook(hook_fn)
+    else:
+        handle = None
     # Note: layer 0 is embeddings output; for intervention you usually want >=1.
 
     int_out = model.generate(
